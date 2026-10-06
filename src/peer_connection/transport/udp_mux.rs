@@ -53,6 +53,10 @@
 //!   matched to a pair. That comes from `IP_PKTINFO`/`RecvMeta::dst_ip`, available on Linux,
 //!   Windows, macOS and the BSDs; where it is missing, bind the mux to a concrete interface
 //!   address instead of `0.0.0.0`.
+//! * **ICE restarts keep the credentials.** Pinning is what makes the route survive a restart,
+//!   and the price is that the peer observes no ufrag/pwd rotation (RFC 8445 restarts normally
+//!   rotate them). The restarted generation still re-gathers and re-checks, and the transport
+//!   genuinely never changed, so there is nothing for the peer to re-pair with.
 
 use std::collections::HashMap;
 use std::fmt;

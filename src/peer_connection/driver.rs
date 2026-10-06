@@ -20,7 +20,7 @@ use crate::peer_connection::transport::{
 use crate::rtp_transceiver::rtp_receiver::RtpReceiverImpl;
 use crate::rtp_transceiver::{RtpReceiver, RtpTransceiverImpl};
 use crate::runtime::{
-    AsyncTcpStream, AsyncUdpSocket, EcnCodepoint, Receiver, RecvMeta, Sender, Transmit,
+    AsyncTcpStream, AsyncUdpSocket, EcnCodepoint, Receiver, RecvMeta, Runtime, Sender, Transmit,
     TrySendError, channel,
 };
 use bytes::BytesMut;
@@ -688,48 +688,14 @@ where
                 .insert(local_addr, runtime.wrap_udp_socket(socket)?);
         }
 
-        let mut tcp_listeners = HashMap::new();
-        for bind in resolve_bind_addrs(&self.tcp_addrs)? {
-            let listener = match std::net::TcpListener::bind(bind.addr) {
-                Ok(listener) => listener,
-                Err(err) => {
-                    if bind.enumerated {
-                        warn!("Skipping TCP bind on local address {}: {err}", bind.addr);
-                    } else {
-                        error!("Failed to bind TCP on address {}: {err}", bind.addr);
-                    }
-                    continue;
-                }
-            };
-            listener.set_nonblocking(true)?;
-            let local_addr = listener.local_addr()?;
-            tcp_listeners.insert(local_addr, runtime.wrap_tcp_listener(listener)?);
-        }
-        if self.udp_sockets.is_empty() && tcp_listeners.is_empty() {
+        self.bind_tcp_listeners(&runtime)?;
+        if self.udp_sockets.is_empty() && self.tcp_transport.is_empty() {
             return Err(Error::Other(
                 "no udp_sockets or tcp_listeners available".to_owned(),
             ));
         }
 
-        self.tcp_transport = RTCTcpTransport::new(tcp_listeners);
-
-        // Rebuilt, not updated: a gatherer's STUN clients and TURN allocations are keyed by
-        // 5-tuples that no longer exist, so there is nothing in the old ones worth carrying over.
-        let local_addrs: Vec<SocketAddr> = self.udp_sockets.keys().copied().collect();
-        self.stun_gatherer = RTCStunGatherer::new(
-            local_addrs.clone(),
-            self.ice_servers.clone(),
-            self.ice_gather_policy,
-            Arc::clone(&runtime),
-        );
-        self.turn_relayer = RTCTurnRelayer::new(
-            local_addrs,
-            self.ice_servers.clone(),
-            self.ice_gather_policy,
-            self.turn_allocation_refresh_interval_cap,
-            runtime,
-            Arc::clone(&self.crypto_provider),
-        );
+        self.rebuild_gatherers(self.ice_servers.clone());
 
         Ok(())
     }
@@ -810,6 +776,22 @@ where
         // ports conflict across connections just like pinned UDP ones. The previous
         // generation's listeners go first, or a rebind could not reclaim them.
         self.tcp_transport = RTCTcpTransport::new(HashMap::new());
+        self.bind_tcp_listeners(&runtime)?;
+
+        // Host-only gatherers: the configured ICE servers are deliberately not handed over
+        // (see above).
+        self.rebuild_gatherers(Vec::new());
+
+        Ok(())
+    }
+
+    /// Bind the configured ICE-TCP listeners into `tcp_transport`.
+    ///
+    /// Shared by [`bind_transports`](Self::bind_transports) and
+    /// [`bind_muxed_transports`](Self::bind_muxed_transports): the mux replaces how UDP sockets
+    /// come to exist, not whether TCP listens. One address failing is skipped and logged (loudly
+    /// for a configured address) exactly as for UDP.
+    fn bind_tcp_listeners(&mut self, runtime: &Arc<dyn Runtime>) -> Result<()> {
         let mut tcp_listeners = HashMap::new();
         for bind in resolve_bind_addrs(&self.tcp_addrs)? {
             let listener = match std::net::TcpListener::bind(bind.addr) {
@@ -828,26 +810,32 @@ where
             tcp_listeners.insert(local_addr, runtime.wrap_tcp_listener(listener)?);
         }
         self.tcp_transport = RTCTcpTransport::new(tcp_listeners);
+        Ok(())
+    }
 
-        // Host-only gatherers: the configured ICE servers are deliberately not handed over
-        // (see above).
+    /// Rebuild the gatherers over the current UDP sockets.
+    ///
+    /// Rebuilt, not updated: a gatherer's STUN clients and TURN allocations are keyed by
+    /// 5-tuples that no longer exist, so there is nothing in the old ones worth carrying over.
+    /// `ice_servers` is the caller's choice rather than the field so the muxed path can force
+    /// host-only gathering — see [`bind_muxed_transports`](Self::bind_muxed_transports).
+    fn rebuild_gatherers(&mut self, ice_servers: Vec<RTCIceServer>) {
+        let runtime = Arc::clone(&self.inner.runtime);
         let local_addrs: Vec<SocketAddr> = self.udp_sockets.keys().copied().collect();
         self.stun_gatherer = RTCStunGatherer::new(
             local_addrs.clone(),
-            Vec::new(),
+            ice_servers.clone(),
             self.ice_gather_policy,
             Arc::clone(&runtime),
         );
         self.turn_relayer = RTCTurnRelayer::new(
             local_addrs,
-            Vec::new(),
+            ice_servers,
             self.ice_gather_policy,
             self.turn_allocation_refresh_interval_cap,
             runtime,
             Arc::clone(&self.crypto_provider),
         );
-
-        Ok(())
     }
 
     /// Mark the connection closing and wake any sender parked in send back-pressure.

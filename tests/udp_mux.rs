@@ -7,11 +7,12 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::transport::udp_mux::{UDPMux, UDPMuxDefault};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
-    RTCPeerConnectionState, SettingEngineBuilder,
+    RTCPeerConnectionState,
 };
 use webrtc::runtime::{Runtime, Sender, channel};
 
@@ -352,6 +353,162 @@ fn test_udp_mux_pinned_credentials_are_unique_and_freed_on_close() {
             Err(e) => panic!("closing the first connection frees its ufrag: {e}"),
         };
         third.close().await?;
+        mux.close();
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .unwrap();
+}
+
+/// An ICE restart on a muxed connection keeps the mux registration: credentials are pinned,
+/// so the ufrag — the mux's routing key — does not change, and the advertised candidates stay
+/// on the shared port across the restart. The muxed side also opts into the restart rebind,
+/// which for a muxed connection re-attaches to the existing registration instead of rebinding.
+#[test]
+fn test_udp_mux_ice_restart_keeps_port_and_ufrag() {
+    block_on(async {
+        env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .is_test(true)
+            .try_init()
+            .ok();
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mux = UDPMuxDefault::new(runtime(), socket)?;
+        let mux_port = mux.local_addr()?.port();
+
+        // The muxed peer offers (full ICE — ICE Lite agents cannot initiate a restart) and
+        // opts into the restart rebind.
+        let (gather_complete_tx, mut gather_rx) = channel::<()>(1);
+        let (connected_tx, mut connected_rx) = channel::<()>(2);
+        let (msg_tx, _msg_rx) = channel::<String>(8);
+        let offerer = PeerConnectionBuilder::<String>::new()
+            .with_handler(Arc::new(PeerHandler {
+                gather_complete_tx,
+                connected_tx,
+                msg_tx,
+                echo: false,
+                runtime: runtime(),
+            }))
+            .with_runtime(runtime())
+            .with_setting_engine(
+                SettingEngineBuilder::new()
+                    .with_discard_local_candidates_during_ice_restart(true)
+                    .build(),
+            )
+            .with_udp_mux(mux.clone())
+            .build()
+            .await?;
+        let offerer_dc = offerer.create_data_channel("test-channel", None).await?;
+        let (dc_open_tx, mut dc_open_rx) = channel::<()>(1);
+        {
+            let dc = offerer_dc.clone();
+            runtime().spawn(Box::pin(async move {
+                while let Some(event) = dc.poll().await {
+                    if let DataChannelEvent::OnOpen = event {
+                        dc_open_tx.try_send(()).ok();
+                    }
+                }
+            }));
+        }
+
+        let mut answerer = build_peer(None, true, false).await?;
+
+        let offer = offerer.create_offer(None).await?;
+        let ufrag_before = offer
+            .sdp
+            .lines()
+            .find(|line| line.starts_with("a=ice-ufrag:"))
+            .map(str::to_owned)
+            .expect("offer carries an ice-ufrag");
+        offerer.set_local_description(offer).await?;
+        timeout(Duration::from_secs(5), gather_rx.recv()).await?;
+        let offer_sdp = offerer
+            .local_description()
+            .await
+            .expect("offerer local description");
+
+        answerer.pc.set_remote_description(offer_sdp).await?;
+        let answer = answerer.pc.create_answer(None).await?;
+        answerer.pc.set_local_description(answer).await?;
+        timeout(Duration::from_secs(5), answerer.gather_rx.recv()).await?;
+        let answer_sdp = answerer
+            .pc
+            .local_description()
+            .await
+            .expect("answerer local description");
+        offerer.set_remote_description(answer_sdp).await?;
+
+        timeout(Duration::from_secs(15), connected_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("muxed offerer did not connect"))?;
+        timeout(Duration::from_secs(5), answerer.connected_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("answerer did not connect"))?;
+
+        timeout(Duration::from_secs(10), dc_open_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("data channel did not open"))?;
+        offerer_dc.send_text(TEST_MESSAGE).await?;
+        let received = timeout(Duration::from_secs(10), answerer.msg_rx.recv())
+            .await?
+            .expect("answerer message");
+        assert_eq!(received, TEST_MESSAGE);
+
+        // Restart on the muxed side.
+        offerer.restart_ice().await?;
+        let restart_offer = offerer.create_offer(None).await?;
+        let ufrag_after = restart_offer
+            .sdp
+            .lines()
+            .find(|line| line.starts_with("a=ice-ufrag:"))
+            .map(str::to_owned)
+            .expect("restart offer carries an ice-ufrag");
+        assert_eq!(
+            ufrag_before, ufrag_after,
+            "a muxed connection pins its ufrag — it is the mux's routing key"
+        );
+        assert!(
+            restart_offer
+                .sdp
+                .contains(&format!("127.0.0.1 {mux_port} typ host")),
+            "restart offer still advertises the shared port:\n{}",
+            restart_offer.sdp
+        );
+
+        offerer.set_local_description(restart_offer).await?;
+        timeout(Duration::from_secs(5), gather_rx.recv()).await?;
+        let restart_offer_sdp = offerer
+            .local_description()
+            .await
+            .expect("offerer local description after restart");
+        answerer
+            .pc
+            .set_remote_description(restart_offer_sdp)
+            .await?;
+        let answer = answerer.pc.create_answer(None).await?;
+        answerer.pc.set_local_description(answer).await?;
+        timeout(Duration::from_secs(5), answerer.gather_rx.recv()).await?;
+        let answer_sdp = answerer
+            .pc
+            .local_description()
+            .await
+            .expect("answerer local description after restart");
+        offerer.set_remote_description(answer_sdp).await?;
+
+        // Still connected, still chatting, still the one port.
+        timeout(Duration::from_secs(15), connected_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("muxed offerer did not reconnect"))?;
+        offerer_dc.send_text(TEST_MESSAGE).await?;
+        let received = timeout(Duration::from_secs(10), answerer.msg_rx.recv())
+            .await?
+            .expect("answerer message after restart");
+        assert_eq!(received, TEST_MESSAGE);
+
+        sleep(Duration::from_millis(100)).await;
+        offerer.close().await?;
+        answerer.pc.close().await?;
         mux.close();
 
         Ok::<(), anyhow::Error>(())
