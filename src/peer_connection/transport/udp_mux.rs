@@ -370,7 +370,9 @@ impl UDPMux for UDPMuxDefault {
 ///
 /// `None` for anything that is not a decodable message with a UTF-8 USERNAME: routing must
 /// never guess, so undecodable traffic simply goes nowhere.
-fn stun_username(data: &[u8]) -> Option<String> {
+///
+/// Shared with the TCP mux, whose first-frame peek demultiplexes by the same attribute.
+pub(crate) fn stun_username(data: &[u8]) -> Option<String> {
     let mut message = StunMessage::new();
     message.unmarshal_binary(data).ok()?;
     let username = message.get(ATTR_USERNAME).ok()?;
