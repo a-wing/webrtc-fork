@@ -116,20 +116,10 @@ impl RTCTurnRelayer {
         ice_servers: Vec<RTCIceServer>,
         ice_gather_policy: RTCIceTransportPolicy,
     ) {
-        // A pure credential rotation — same servers, same policy, different username or
-        // password — must NOT tear the allocations down. `local_addrs` is fixed at
-        // construction (the sockets are shared with host candidates), so a teardown here
-        // means the following `gather()` re-`Allocate`s on exactly the same 5-tuple. The
-        // server still holds the previous allocation for it and answers **437 (Allocation
-        // Mismatch)** per RFC 8656 §7.2, and the restart gathers no relay candidate at all
-        // (issue #835).
-        //
-        // An allocation is a 5-tuple resource, independent of the credential that created
-        // it, so the correct move is to re-sign the allocation we already have: update the
-        // client's credential and Refresh. Allocation, permissions and channel bindings all
-        // survive, so the data path is never interrupted.
+        // RFC 8656 section 5 binds subsequent requests to the allocation's
+        // original username. Keep established clients and their keys intact;
+        // the updated configuration supplies credentials for future allocations.
         if self.is_credential_only_change(&ice_servers, ice_gather_policy) {
-            self.rotate_credentials(&ice_servers);
             self.ice_servers = ice_servers;
             return;
         }
@@ -166,8 +156,8 @@ impl RTCTurnRelayer {
             return false;
         }
 
-        // Nothing to re-sign unless every live client's allocation is established; a client
-        // still mid-Allocate has no allocation to keep.
+        // Only established allocations can retain their original credentials;
+        // a client still mid-Allocate has no allocation to keep.
         if self
             .clients
             .values()
@@ -189,50 +179,6 @@ impl RTCTurnRelayer {
         match (urls_of(ice_servers), urls_of(&self.ice_servers)) {
             (Some(new_urls), Some(old_urls)) => !new_urls.is_empty() && new_urls == old_urls,
             _ => false,
-        }
-    }
-
-    /// Re-signs every live allocation with the rotated credential and refreshes it.
-    ///
-    /// Best-effort per client: a client whose URL is no longer present, or whose refresh
-    /// fails to encode, is left alone rather than torn down — its allocation keeps working
-    /// on the old credential until it expires, which is strictly better than forcing the
-    /// 437 this path exists to avoid.
-    fn rotate_credentials(&mut self, ice_servers: &[RTCIceServer]) {
-        // url string -> (username, credential), matching how `gather` derives them.
-        let mut credentials: HashMap<String, (String, String)> = HashMap::new();
-        for ice_server in ice_servers {
-            let Ok(urls) = ice_server.urls() else {
-                continue;
-            };
-            for url in urls {
-                credentials.insert(
-                    url.to_string(),
-                    (url.username.clone(), url.password.clone()),
-                );
-            }
-        }
-
-        for managed in self.clients.values_mut() {
-            let Some((username, password)) = credentials.get(&managed.url) else {
-                continue;
-            };
-
-            let _ = managed
-                .client
-                .update_credentials(username.clone(), password.clone());
-
-            if let Err(err) = managed.client.refresh_allocations(self.runtime.now()) {
-                warn!(
-                    "TURN credential rotation: refresh failed for {} via {}: {}",
-                    managed.local_addr, managed.url, err
-                );
-            } else {
-                debug!(
-                    "TURN credentials rotated for {} via {}, allocation kept",
-                    managed.local_addr, managed.url
-                );
-            }
         }
     }
 
